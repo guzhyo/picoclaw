@@ -1,0 +1,106 @@
+# .github/workflows/auto-sync-upstream.yml
+name: 自动同步上游仓库更新
+
+# 触发条件：每天UTC 0点/12点执行 + 手动触发
+on:
+  schedule:
+    - cron: '0 0,12 * * *'  # 北京时间8点、20点各同步一次
+  workflow_dispatch:
+    inputs:
+      sync_branch:
+        description: '指定要同步的分支（默认main）'
+        required: false
+        default: 'main'
+
+# 必要权限配置
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync-upstream:
+    runs-on: ubuntu-latest
+    # 同步picoclaw的main分支（可根据实际分支名调整）
+    strategy:
+      matrix:
+        branch: [main]  # 若原仓库有其他分支（如dev），可添加到列表
+      fail-fast: false
+
+    steps:
+      # 步骤1：检出当前fork仓库的代码
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ matrix.branch }}
+
+      # 步骤2：配置Git基础信息
+      - name: 配置Git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      # 步骤3：添加picoclaw上游仓库并拉取更新
+      - name: 拉取上游仓库更新
+        env:
+          # 已替换为sipeed/picoclaw的官方地址
+          UPSTREAM_REPO: "https://github.com/sipeed/picoclaw.git"
+        run: |
+          # 添加上游仓库（已存在则更新地址）
+          if git remote | grep -q upstream; then
+            git remote set-url upstream $UPSTREAM_REPO
+          else
+            git remote add upstream $UPSTREAM_REPO
+          fi
+          
+          # 拉取上游所有分支的最新代码
+          git fetch upstream
+          echo "✅ 成功拉取上游仓库 sipeed/picoclaw 的更新"
+
+      # 步骤4：尝试快进合并上游更新
+      - name: 合并上游更新（无冲突）
+        id: merge
+        continue-on-error: true
+        run: |
+          git merge --ff-only upstream/${{ matrix.branch }}
+          echo "✅ 成功合并上游 ${matrix.branch} 分支的更新"
+
+      # 步骤5：冲突时自动创建PR
+      - name: 处理合并冲突（创建PR）
+        if: steps.merge.outcome == 'failure'
+        run: |
+          CONFLICT_BRANCH="sync-conflict-${{ matrix.branch }}-$(date +%Y%m%d%H%M)"
+          git checkout -b $CONFLICT_BRANCH
+          
+          # 强制合并（保留冲突标记）
+          git merge upstream/${{ matrix.branch }} --no-ff -m "Merge upstream/${{ matrix.branch }} (with conflicts)"
+          
+          # 推送冲突分支到fork仓库
+          git push origin $CONFLICT_BRANCH
+          
+          # 创建PR
+          gh pr create \
+            --base ${{ matrix.branch }} \
+            --head $CONFLICT_BRANCH \
+            --title "【自动同步】解决 ${{ matrix.branch }} 分支合并冲突" \
+            --body "自动同步 sipeed/picoclaw 时发现合并冲突，请手动解决后合并此PR。
+            上游仓库：https://github.com/sipeed/picoclaw
+            冲突分支：${{ matrix.branch }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 步骤6：推送合并后的代码到fork仓库
+      - name: 推送代码到Fork仓库
+        if: steps.merge.outcome == 'success'
+        run: |
+          git push origin ${{ matrix.branch }}
+          echo "✅ 成功将更新推送到Fork仓库的 ${{ matrix.branch }} 分支"
+
+      # 步骤7：输出同步结果
+      - name: 同步结果汇总
+        run: |
+          if [ "${{ steps.merge.outcome }}" = "success" ]; then
+            echo "🎉 分支 ${{ matrix.branch }} 同步 sipeed/picoclaw 完成！"
+          else
+            echo "⚠️  分支 ${{ matrix.branch }} 同步时存在冲突，已创建PR请手动处理！"
+          fi
